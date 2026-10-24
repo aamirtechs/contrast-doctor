@@ -1,0 +1,7 @@
+# Sample palette file for contrast-doctor.
+# Lines may be bare hex colors or "name: #hex" entries.
+ink: #111827
+muted: #9ca3af
+paper: #ffffff
+brand: #2563eb
+#d1d5db

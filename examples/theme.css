@@ -1,0 +1,24 @@
+/* Sample design-token stylesheet for contrast-doctor. */
+:root {
+  --brand-600: #2563eb;
+  --brand-700: #1d4ed8;
+  --ink: #111827;
+  --text-muted: #9ca3af;
+  --text-faint: #d1d5db;
+  --paper: #ffffff;
+  --accent: #f59e0b;
+}
+
+body {
+  color: #111827;
+  background-color: #ffffff;
+}
+
+a {
+  color: #2563eb;
+}
+
+.badge {
+  color: white;
+  background: #f59e0b;
+}
