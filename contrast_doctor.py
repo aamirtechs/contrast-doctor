@@ -675,6 +675,7 @@ def render_text(results, label, source_desc):
     lines.append("")
     lines.append("%d pairs: %d passed, %d failed (%s)"
                  % (len(results), passed, failed, label))
+    lines.append("%.1f%% of pairs pass" % (100.0 * passed / len(results)))
     return "\n".join(lines)
 
 
@@ -707,6 +708,7 @@ def report_to_json(results, label, source_desc, args):
             "pairs": len(results),
             "passed": passed,
             "failed": len(results) - passed,
+            "pass_percent": round(100.0 * passed / len(results), 1),
         },
     }
 
@@ -777,6 +779,12 @@ def build_parser():
                         help="custom minimum ratio, overrides --level/--large")
     parser.add_argument("--check", action="store_true",
                         help="CI gate: exit 1 when any pair fails")
+    parser.add_argument("--fail-below", type=float, default=None,
+                        metavar="PCT",
+                        help="ratchet for --check: exit 1 only when the "
+                             "share of passing pairs drops below PCT "
+                             "percent (e.g. 95); the pass percentage is "
+                             "always printed in the summary")
     parser.add_argument("--json", action="store_true",
                         help="print machine-readable JSON report")
     parser.add_argument("--fix-out", default=None, metavar="FILE",
@@ -789,6 +797,11 @@ def build_parser():
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.fail_below is not None and not 0.0 <= args.fail_below <= 100.0:
+        parser.error("--fail-below must be between 0 and 100")
+    if args.fail_below is not None and not args.check:
+        parser.error("--fail-below only makes sense together with --check")
 
     if args.min_ratio is not None:
         if not 1.0 <= args.min_ratio <= 21.0:
@@ -842,6 +855,9 @@ def main(argv=None):
     else:
         print(render_text(results, label, source_desc))
 
+    if args.check and args.fail_below is not None:
+        pass_pct = 100.0 * (len(results) - failed) / len(results)
+        return 1 if pass_pct < args.fail_below else 0
     if args.check and failed:
         return 1
     return 0

@@ -150,6 +150,7 @@ is a palette); override with `--format css|palette|json`.
 | `--large` | Use large-text thresholds (3:1 AA, 4.5:1 AAA) |
 | `--min-ratio RATIO` | Custom minimum ratio, overrides `--level`/`--large` |
 | `--check` | CI gate: exit 1 when any pair fails |
+| `--fail-below PCT` | ratchet for `--check`: exit 1 only when the pass share drops below PCT (e.g. `--fail-below 95`); the percentage is printed in the summary either way |
 | `--json` | Print the machine-readable report instead of text |
 | `--fix-out FILE` | Write suggested overrides as a CSS file |
 | `--format` | `auto` (default), `css`, `palette`, or `json` |

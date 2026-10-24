@@ -451,3 +451,90 @@ class ColorMixTests(unittest.TestCase):
     def test_parse_css_picks_up_mix_in_background(self):
         colors = parse_css("a { background: color-mix(in srgb, #ff0000 25%, #0000ff); }")
         self.assertEqual([c.hex for c in colors], ["#4000bf"])
+
+
+class FailBelowTests(unittest.TestCase):
+    """The --fail-below ratchet for --check (#2)."""
+
+    def _run(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    PASSING = ("#000000", "#00008b")   # both pass 4.5:1 on white
+    FAILING = "#777777"                # 4.48:1, under the gate
+
+    def _palette(self, tmp_path, passing, total):
+        """A CSS file with `total` tokens, `passing` of which pass on white."""
+        lines = [":root {"]
+        for i in range(total):
+            if i < passing:
+                color = self.PASSING[i % len(self.PASSING)]
+            else:
+                color = self.FAILING
+            lines.append("  --c%d: %s;" % (i, color))
+        lines.append("}")
+        path = os.path.join(tmp_path, "p.css")
+        with open(path, "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+        return path
+
+    def _run_expecting_error(self, argv):
+        """parser.error exits; capture its stderr instead of raising."""
+        out, err = io.StringIO(), io.StringIO()
+        with self.assertRaises(SystemExit), redirect_stdout(out), redirect_stderr(err):
+            main(argv)
+        return out.getvalue(), err.getvalue()
+
+    def _argv(self, path, *extra):
+        return [*extra, "--bg", "#ffffff", path]
+
+    def test_exit_zero_when_pass_share_meets_threshold(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._palette(tmp, passing=9, total=10)
+            code, out, _ = self._run(self._argv(path, "--check", "--fail-below", "90"))
+            self.assertEqual(code, 0)
+            self.assertIn("90.0% of pairs pass", out)
+
+    def test_exit_one_when_pass_share_drops_below_threshold(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._palette(tmp, passing=8, total=10)
+            code, out, _ = self._run(self._argv(path, "--check", "--fail-below", "90"))
+            self.assertEqual(code, 1)
+            self.assertIn("80.0% of pairs pass", out)
+
+    def test_plain_check_still_fails_on_any_single_pair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._palette(tmp, passing=9, total=10)
+            code, _, _ = self._run(self._argv(path, "--check"))
+            self.assertEqual(code, 1)
+
+    def test_summary_always_prints_the_percentage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._palette(tmp, passing=10, total=10)
+            code, out, _ = self._run(self._argv(path))
+            self.assertEqual(code, 0)
+            self.assertIn("100.0% of pairs pass", out)
+
+    def test_json_summary_carries_pass_percent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._palette(tmp, passing=9, total=10)
+            code, out, _ = self._run(self._argv(path, "--json"))
+            self.assertEqual(code, 0)
+            report = json.loads(out)
+            self.assertEqual(report["summary"]["pass_percent"], 90.0)
+
+    def test_fail_below_requires_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._palette(tmp, passing=10, total=10)
+            _, err = self._run_expecting_error(self._argv(path, "--fail-below", "90"))
+            self.assertIn("--fail-below only makes sense together with --check", err)
+
+    def test_fail_below_range_is_validated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._palette(tmp, passing=10, total=10)
+            _, err = self._run_expecting_error(
+                self._argv(path, "--check", "--fail-below", "150")
+            )
+            self.assertIn("between 0 and 100", err)
