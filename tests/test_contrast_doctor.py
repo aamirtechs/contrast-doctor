@@ -17,6 +17,7 @@ from contrast_doctor import (
     parse_palette, relative_luminance, render_text, report_to_json,
     rgb_to_hex, rgb_to_hsl, hsl_to_rgb, sanitize_var_name, suggest_fix,
     threshold_for, write_fix_file,
+    _resolve_color_mix, _resolve_oklch,
 )
 
 
@@ -379,3 +380,74 @@ class NoEmDashTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OklchTests(unittest.TestCase):
+    def test_known_anchors(self):
+        self.assertEqual(_resolve_oklch("oklch(1 0 0)"), "#ffffff")
+        self.assertEqual(_resolve_oklch("oklch(0 0 0)"), "#000000")
+        # CSS Color 4: pure red is oklch(62.8% 0.2577 29.23)
+        self.assertEqual(_resolve_oklch("oklch(62.8% 0.2577 29.23)"), "#ff0000")
+
+    def test_percent_lightness_equals_zero_one_form(self):
+        self.assertEqual(
+            _resolve_oklch("oklch(62.8% 0.2577 29.23)"),
+            _resolve_oklch("oklch(0.628 0.2577 29.23)"),
+        )
+
+    def test_hue_wraps(self):
+        self.assertEqual(
+            _resolve_oklch("oklch(0.628 0.2577 389.23)"),
+            _resolve_oklch("oklch(0.628 0.2577 29.23)"),
+        )
+
+    def test_out_of_gamut_clamps(self):
+        # chroma beyond sRGB gamut clamps instead of being dropped
+        out = _resolve_oklch("oklch(0.5 0.4 140)")
+        self.assertRegex(out, r"^#[0-9a-f]{6}$")
+
+    def test_alpha_and_garbage_are_skipped(self):
+        self.assertIsNone(_resolve_oklch("oklch(0.5 0.1 200 / 0.5)"))
+        self.assertIsNone(_resolve_oklch("oklch(0.5 0.1)"))
+        self.assertIsNone(_resolve_oklch("oklch(high none low)"))
+
+    def test_parse_css_picks_up_oklch_tokens(self):
+        colors = parse_css(":root { --accent: oklch(62.8% 0.2577 29.23); }")
+        self.assertEqual([(c.name, c.hex) for c in colors], [("--accent", "#ff0000")])
+
+
+class ColorMixTests(unittest.TestCase):
+    def test_explicit_weights(self):
+        self.assertEqual(
+            _resolve_color_mix("color-mix(in srgb, #ff0000 25%, #0000ff)"),
+            "#4000bf",
+        )
+        self.assertEqual(
+            _resolve_color_mix("color-mix(in srgb, #ff0000 25%, #0000ff 75%)"),
+            "#4000bf",
+        )
+
+    def test_default_is_fifty_fifty(self):
+        self.assertEqual(_resolve_color_mix("color-mix(in srgb, red, blue)"), "#800080")
+
+    def test_single_weight_takes_remainder(self):
+        self.assertEqual(
+            _resolve_color_mix("color-mix(in srgb, red 20%, blue)"), "#3300cc"
+        )
+
+    def test_mixes_resolve_their_own_colors(self):
+        self.assertEqual(
+            _resolve_color_mix("color-mix(in srgb, oklch(1 0 0) 50%, black)"),
+            "#808080",
+        )
+
+    def test_non_srgb_and_broken_forms_are_skipped(self):
+        self.assertIsNone(_resolve_color_mix("color-mix(in oklab, red, blue)"))
+        self.assertIsNone(_resolve_color_mix("color-mix(in srgb, red)"))
+        self.assertIsNone(_resolve_color_mix("color-mix(in srgb, var(--x), blue)"))
+        # CSS normalizes weights that sum over 100 instead of rejecting them
+        self.assertEqual(_resolve_color_mix("color-mix(in srgb, red 120%, blue)"), "#ff0000")
+
+    def test_parse_css_picks_up_mix_in_background(self):
+        colors = parse_css("a { background: color-mix(in srgb, #ff0000 25%, #0000ff); }")
+        self.assertEqual([c.hex for c in colors], ["#4000bf"])
