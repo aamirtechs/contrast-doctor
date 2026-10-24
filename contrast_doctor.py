@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import math
 import re
 import sys
 from collections import namedtuple
@@ -35,6 +36,8 @@ _RGB_FN_RE = re.compile(
     r"rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})"
     r"(?:\s*,\s*[\d.]+\s*)?\)"
 )
+_OKLCH_FN_RE = re.compile(r"oklch\(([^)]*)\)", re.IGNORECASE)
+_COLOR_MIX_FN = "color-mix("
 
 
 def normalize_hex(value):
@@ -196,12 +199,130 @@ class InputError(Exception):
     """Raised when an input file cannot be read or parsed."""
 
 
+def _oklch_to_srgb_hex(l_raw, c_raw, h_raw):
+    """Convert OKLCH components to ``#rrggbb``, clamping out-of-gamut values.
+
+    Accepts lightness as 0-1 or a percentage. Returns None for components
+    that do not parse, or an alpha channel (only opaque colors resolve).
+    """
+    try:
+        l_text, c_text, h_text = l_raw.strip(), c_raw.strip(), h_raw.strip()
+        if "/" in l_text or "/" in c_text or "/" in h_text:
+            return None
+        l_value = float(l_text[:-1]) / 100.0 if l_text.endswith("%") else float(l_text)
+        c_value = float(c_text)
+        h_value = float(h_text) % 360.0
+    except ValueError:
+        return None
+    a = c_value * math.cos(math.radians(h_value))
+    b = c_value * math.sin(math.radians(h_value))
+    # OKLab -> LMS -> linear sRGB (CSS Color 4 reference matrices)
+    l_ = l_value + 0.3963377774 * a + 0.2158037573 * b
+    m_ = l_value - 0.1055613458 * a - 0.0638541728 * b
+    s_ = l_value - 0.0894841775 * a - 1.2914855480 * b
+    l_, m_, s_ = l_ ** 3, m_ ** 3, s_ ** 3
+    r_lin = +4.0767416621 * l_ - 3.3077115913 * m_ + 0.2309699292 * s_
+    g_lin = -1.2684380046 * l_ + 2.6097574011 * m_ - 0.3413193965 * s_
+    b_lin = -0.0041960863 * l_ - 0.7034186147 * m_ + 1.7076147010 * s_
+
+    def encode(channel):
+        channel = max(0.0, min(1.0, channel))
+        return round(
+            12.92 * channel
+            if channel <= 0.0031308
+            else 1.055 * channel ** (1 / 2.4) - 0.055
+        ) * 255
+
+    return "#%02x%02x%02x" % (encode(r_lin), encode(g_lin), encode(b_lin))
+
+
+def _resolve_oklch(value):
+    """Resolve an ``oklch(...)`` call found in *value* to ``#rrggbb`` or None."""
+    match = _OKLCH_FN_RE.search(value)
+    if not match:
+        return None
+    parts = match.group(1).split()
+    if len(parts) != 3:
+        return None
+    return _oklch_to_srgb_hex(*parts)
+
+
+def _matching_paren(value, start):
+    """Index of the ``)`` closing the ``(`` at *start*, or -1."""
+    depth = 0
+    for i in range(start, len(value)):
+        if value[i] == "(":
+            depth += 1
+        elif value[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _resolve_color_mix(value):
+    """Resolve ``color-mix(in srgb, A p1, B p2)`` to ``#rrggbb`` or None.
+
+    Only ``in srgb`` with two opaque colors mixes; anything else returns
+    None. Weights are normalized like CSS: one missing weight takes the
+    remainder, both missing means 50/50.
+    """
+    head = value.lower().find(_COLOR_MIX_FN)
+    if head < 0:
+        return None
+    open_at = head + len(_COLOR_MIX_FN) - 1
+    close_at = _matching_paren(value, open_at)
+    if close_at < 0:
+        return None
+    inner = value[open_at + 1 : close_at]
+    if not inner.lower().lstrip().startswith("in srgb"):
+        return None
+    body = inner[len("in srgb") :].lstrip()
+    if not body.startswith(","):
+        return None
+    parts = body[1:].split(",")
+    if len(parts) != 2:
+        return None
+    sides = []
+    for part in parts:
+        part = part.strip()
+        match = re.match(r"^(.+?)\s+([\d.]+)%$", part)
+        if match:
+            sides.append((match.group(1).strip(), float(match.group(2))))
+        else:
+            sides.append((part, None))
+    (a_text, a_weight), (b_text, b_weight) = sides
+    if a_weight is None and b_weight is None:
+        a_weight = b_weight = 50.0
+    elif a_weight is None:
+        a_weight = 100.0 - b_weight
+    elif b_weight is None:
+        b_weight = 100.0 - a_weight
+    # a weight over 100 leaves its neighbour negative; CSS clamps the
+    # remainder to 0 and normalises whatever sum is left
+    a_weight = max(0.0, min(100.0, a_weight))
+    b_weight = max(0.0, min(100.0, b_weight))
+    total = a_weight + b_weight
+    if total <= 0:
+        return None
+    first, second = _color_from_token(a_text), _color_from_token(b_text)
+    if not first or not second:
+        return None
+    wa, wb = a_weight / total, b_weight / total
+    mixed = bytes(
+        round(wa * f + wb * s)
+        for f, s in zip(bytes.fromhex(first[1:]), bytes.fromhex(second[1:]))
+    )
+    return "#%02x%02x%02x" % tuple(mixed)
+
+
 def _color_from_token(token):
     """Resolve a CSS color token to ``#rrggbb`` or return None.
 
     Accepts hex colors, ``rgb()``/``rgba()`` functions (alpha is ignored),
-    and CSS named colors. Anything else (var(), gradients, keywords like
-    ``inherit``) returns None.
+    ``oklch()`` (converted to sRGB, out-of-gamut clamped), simple
+    ``color-mix(in srgb, ...)`` expressions, and CSS named colors. Anything
+    else (var(), gradients, keywords like ``inherit``) returns None.
     """
     token = token.strip().rstrip(";").strip()
     if not token:
@@ -223,11 +344,23 @@ def _color_from_token(token):
     lowered = token.lower()
     if lowered in NAMED_COLORS:
         return NAMED_COLORS[lowered]
+    if lowered.startswith("oklch("):
+        return _resolve_oklch(token)
+    if lowered.startswith("color-mix("):
+        return _resolve_color_mix(token)
     return None
 
 
 def _first_color_in_value(value):
     """Extract the first color token from a CSS declaration value."""
+    # Functional notations contain spaces, commas and parentheses, so they
+    # must match against the whole value before the token split shreds them.
+    mix = _resolve_color_mix(value)
+    if mix:
+        return mix
+    oklch = _resolve_oklch(value)
+    if oklch:
+        return oklch
     for token in re.split(r"[\s,()/]+", value):
         if not token or token in ("!", "important"):
             continue
@@ -542,6 +675,7 @@ def render_text(results, label, source_desc):
     lines.append("")
     lines.append("%d pairs: %d passed, %d failed (%s)"
                  % (len(results), passed, failed, label))
+    lines.append("%.1f%% of pairs pass" % (100.0 * passed / len(results)))
     return "\n".join(lines)
 
 
@@ -574,6 +708,7 @@ def report_to_json(results, label, source_desc, args):
             "pairs": len(results),
             "passed": passed,
             "failed": len(results) - passed,
+            "pass_percent": round(100.0 * passed / len(results), 1),
         },
     }
 
@@ -644,6 +779,12 @@ def build_parser():
                         help="custom minimum ratio, overrides --level/--large")
     parser.add_argument("--check", action="store_true",
                         help="CI gate: exit 1 when any pair fails")
+    parser.add_argument("--fail-below", type=float, default=None,
+                        metavar="PCT",
+                        help="ratchet for --check: exit 1 only when the "
+                             "share of passing pairs drops below PCT "
+                             "percent (e.g. 95); the pass percentage is "
+                             "always printed in the summary")
     parser.add_argument("--json", action="store_true",
                         help="print machine-readable JSON report")
     parser.add_argument("--fix-out", default=None, metavar="FILE",
@@ -656,6 +797,11 @@ def build_parser():
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.fail_below is not None and not 0.0 <= args.fail_below <= 100.0:
+        parser.error("--fail-below must be between 0 and 100")
+    if args.fail_below is not None and not args.check:
+        parser.error("--fail-below only makes sense together with --check")
 
     if args.min_ratio is not None:
         if not 1.0 <= args.min_ratio <= 21.0:
@@ -709,6 +855,9 @@ def main(argv=None):
     else:
         print(render_text(results, label, source_desc))
 
+    if args.check and args.fail_below is not None:
+        pass_pct = 100.0 * (len(results) - failed) / len(results)
+        return 1 if pass_pct < args.fail_below else 0
     if args.check and failed:
         return 1
     return 0
